@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AnonTalk - Voice Chat</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for better aesthetics */
+        body {
+            background-color: #0f172a; /* Slate 900 */
+            color: #e2e8f0; /* Slate 200 */
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+        }
+        .card {
+            background-color: #1e293b; /* Slate 800 */
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid #334155; /* Slate 700 */
+        }
+        button {
+            transition: all 0.15s ease-in-out;
+        }
+        button:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        .mic-active {
+            animation: pulse-ring 1.5s cubic-bezier(0.66, 0, 0, 1) infinite;
+        }
+        @keyframes pulse-ring {
+            0% {
+                box-shadow: 0 0 0 0px rgba(74, 222, 128, 0.7);
+            }
+            100% {
+                box-shadow: 0 0 0 15px rgba(74, 222, 128, 0);
+            }
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center p-4">
+
+    <div id="app" class="card w-full max-w-lg p-8 rounded-xl space-y-6">
+        <header class="text-center">
+            <h1 class="text-4xl font-extrabold text-green-400">AnonTalk</h1>
+            <p class="text-slate-400 mt-2">Voice Chat with Strangers (Audio Only)</p>
+            <p id="user-id-display" class="text-xs mt-2 text-slate-500">User ID: Loading...</p>
+        </header>
+
+        <!-- Status & Microphone Display -->
+        <div class="flex flex-col items-center justify-center space-y-4 py-6">
+            <div id="mic-indicator" class="w-16 h-16 rounded-full bg-slate-600 flex items-center justify-center text-3xl transition duration-300">
+                <svg id="mic-icon" xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7v-2m7-7a7 7 0 00-7-7v2m7 7h-2m-7 7l-3-3m0 0l-3-3m3 3V4"/>
+                </svg>
+            </div>
+            <p id="status-message" class="text-lg font-semibold text-center h-6">Please press "Start Chat" to begin.</p>
+        </div>
+
+        <!-- Controls -->
+        <div class="flex space-x-4 justify-center">
+            <button id="start-button" onclick="startChat()" class="px-8 py-3 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:bg-slate-700">
+                Start Chat
+            </button>
+            <button id="stop-button" onclick="stopChat()" class="px-8 py-3 bg-red-600 text-white font-bold rounded-lg hover:bg-red-700 disabled:bg-slate-700" disabled>
+                Stop Chat
+            </button>
+        </div>
+
+        <!-- Hidden Audio Element for Remote Stream -->
+        <audio id="remote-audio" autoplay></audio>
+        <!-- Modal for Permissions/Errors -->
+        <div id="modal" class="fixed inset-0 bg-black bg-opacity-70 hidden items-center justify-center p-4 z-50">
+            <div class="bg-white p-6 rounded-lg text-slate-900 max-w-sm w-full space-y-4">
+                <h3 id="modal-title" class="text-xl font-bold">Error</h3>
+                <p id="modal-content"></p>
+                <button onclick="document.getElementById('modal').classList.add('hidden')" class="w-full py-2 bg-blue-600 text-white rounded-lg">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, deleteDoc, updateDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set up global Firebase variables
+        window.db = null;
+        window.auth = null;
+        window.appId = null;
+        window.userId = null;
+        window.isAuthReady = false;
+
+        // --- Core Application State & Constants ---
+        window.localStream = null;
+        window.peerConnection = null;
+        window.matchDocRef = null;
+        window.remotePeerId = null;
+        window.isWaiting = false;
+        window.MAX_RETRIES = 3;
+        window.BASE_RETRY_DELAY = 1000; // 1 second
+
+        const COLLECTION_PATH = 'voice_matches';
+        const STATUS = {
+            IDLE: "Please press 'Start Chat' to begin.",
+            REQUESTING_MIC: "Requesting microphone access...",
+            WAITING: "Searching for a stranger... (Keep this window open)",
+            MATCHED: "Connected! Say hello!",
+            ERROR: "An error occurred. Check console."
+        };
+
+        const elements = {
+            statusMessage: document.getElementById('status-message'),
+            startButton: document.getElementById('start-button'),
+            stopButton: document.getElementById('stop-button'),
+            micIndicator: document.getElementById('mic-indicator'),
+            remoteAudio: document.getElementById('remote-audio'),
+            userIdDisplay: document.getElementById('user-id-display'),
+            modal: document.getElementById('modal'),
+            modalTitle: document.getElementById('modal-title'),
+            modalContent: document.getElementById('modal-content')
+        };
+
+        // Utility to show modal instead of alert
+        function showModal(title, content) {
+            elements.modalTitle.textContent = title;
+            elements.modalContent.textContent = content;
+            elements.modal.classList.remove('hidden');
+            elements.modal.classList.add('flex');
+        }
+
+        function updateStatus(message, isMicActive = false) {
+            elements.statusMessage.textContent = message;
+            if (isMicActive) {
+                elements.micIndicator.classList.add('bg-green-500', 'mic-active');
+                elements.micIndicator.classList.remove('bg-slate-600');
+            } else {
+                elements.micIndicator.classList.remove('bg-green-500', 'mic-active');
+                elements.micIndicator.classList.add('bg-slate-600');
+            }
+        }
+
+        function enableControls(start, stop) {
+            elements.startButton.disabled = !start;
+            elements.stopButton.disabled = !stop;
+        }
+
+        // --- Firebase Initialization and Auth ---
+
+        async function initFirebase() {
+            setLogLevel('debug');
+            try {
+                window.appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                const app = initializeApp(firebaseConfig);
+                window.db = getFirestore(app);
+                window.auth = getAuth(app);
+
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(window.auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(window.auth);
+                }
+
+                onAuthStateChanged(window.auth, (user) => {
+                    if (user) {
+                        window.userId = user.uid;
+                        elements.userIdDisplay.textContent = `User ID: ${window.userId}`;
+                        window.isAuthReady = true;
+                        enableControls(true, false);
+                    } else {
+                        window.userId = null;
+                        elements.userIdDisplay.textContent = `User ID: Not Signed In`;
+                        window.isAuthReady = false;
+                        updateStatus(STATUS.ERROR);
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                showModal("Startup Error", "Failed to initialize Firebase services. Please check the console for details.");
+            }
+        }
+
+        // --- WebRTC Setup ---
+
+        const iceServers = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+            ]
+        };
+
+        async function setupWebRTC(isOfferer) {
+            if (window.peerConnection) window.peerConnection.close();
+            
+            window.peerConnection = new RTCPeerConnection(iceServers);
+            
+            // 1. Handle remote stream (audio)
+            window.peerConnection.ontrack = (event) => {
+                console.log('Received remote track', event.track);
+                if (event.streams && event.streams[0]) {
+                    elements.remoteAudio.srcObject = event.streams[0];
+                }
+            };
+
+            // 2. Handle ICE candidates (network information)
+            window.peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    // Send the candidate via Firestore
+                    if (window.matchDocRef) {
+                        console.log('Sending ICE candidate:', event.candidate);
+                        const fieldName = isOfferer ? 'candidatesA' : 'candidatesB';
+                        updateDoc(window.matchDocRef, {
+                            [fieldName]: [...(window.matchDoc.data()[fieldName] || []), event.candidate.toJSON()]
+                        }).catch(e => console.error("Error updating ICE candidate:", e));
+                    }
+                }
+            };
+            
+            // Add local audio track to the connection
+            if (window.localStream) {
+                window.localStream.getTracks().forEach(track => {
+                    window.peerConnection.addTrack(track, window.localStream);
+                });
+            } else {
+                console.error("Local stream not available.");
+            }
+
+            return window.peerConnection;
+        }
+
+        // --- Matchmaking Logic (The Omegle Part) ---
+
+        async function findOrCreateMatch() {
+            if (!window.isAuthReady) return;
+
+            updateStatus(STATUS.WAITING, true);
+            enableControls(false, true);
+
+            const matchesCol = collection(window.db, `artifacts/${window.appId}/public/data/${COLLECTION_PATH}`);
+            
+            try {
+                // 1. Look for a waiting peer (user2Id is null)
+                const q = query(matchesCol, where("user2Id", "==", null));
+                const snapshot = await getDocs(q);
+                
+                if (!snapshot.empty) {
+                    // --- MATCHMAKER ROLE (Found a waiting peer) ---
+                    window.matchDoc = snapshot.docs[0];
+                    window.matchDocRef = doc(window.db, window.matchDoc.ref.path);
+                    window.remotePeerId = window.matchDoc.data().user1Id;
+                    console.log(`Match found with ${window.remotePeerId}. Acting as Answerer.`);
+
+                    const pc = await setupWebRTC(false); // setup as Answerer
+                    const offerSdp = new RTCSessionDescription(window.matchDoc.data().offer);
+                    await pc.setRemoteDescription(offerSdp);
+                    
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+
+                    // Send the Answer back to the waiting document and mark as matched
+                    await updateDoc(window.matchDocRef, {
+                        user2Id: window.userId,
+                        answer: answer.toJSON(),
+                        status: 'matched'
+                    });
+
+                    // Start listening for ICE candidates from the Offerer
+                    listenForMatchUpdates(false);
+                    updateStatus(STATUS.MATCHED, true);
+
+                } else {
+                    // --- WAITING ROLE (No peer found) ---
+                    window.isWaiting = true;
+                    
+                    const pc = await setupWebRTC(true); // setup as Offerer
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+
+                    // Create a new match document and wait for someone to join
+                    window.matchDocRef = doc(matchesCol); // Let Firestore generate the ID
+                    await setDoc(window.matchDocRef, {
+                        user1Id: window.userId,
+                        user2Id: null, // Waiting
+                        offer: offer.toJSON(),
+                        answer: null,
+                        candidatesA: [],
+                        candidatesB: [],
+                        status: 'waiting',
+                        createdAt: new Date().getTime()
+                    });
+                    console.log(`No match found. Waiting at document ID: ${window.matchDocRef.id}. Acting as Offerer.`);
+
+                    // Start listening for an Answer in the document
+                    listenForMatchUpdates(true);
+                }
+
+            } catch (error) {
+                console.error("Matchmaking/WebRTC setup failed:", error);
+                showModal("Chat Error", "Could not establish a connection. Please ensure microphone permissions are granted.");
+                stopChat(true); // Clean up
+            }
+        }
+
+        function listenForMatchUpdates(isOfferer) {
+            if (!window.matchDocRef) return;
+            
+            // Keep track of candidates already added to avoid duplicates
+            const processedCandidatesA = new Set();
+            const processedCandidatesB = new Set();
+
+            onSnapshot(window.matchDocRef, (docSnapshot) => {
+                if (!docSnapshot.exists()) {
+                    // The document was deleted, meaning the match ended or was cancelled by the other user.
+                    if (window.peerConnection) {
+                         showModal("Chat Ended", "The other user has disconnected. Press 'Start Chat' to find a new person.");
+                         stopChat(false); // Stop the chat but keep local stream
+                    }
+                    return;
+                }
+                
+                const data = docSnapshot.data();
+
+                // 1. Handle Matched State (Offerer receives Answer)
+                if (isOfferer && data.status === 'matched' && data.answer) {
+                    console.log('Match established! Received Answer.');
+                    window.remotePeerId = data.user2Id;
+                    const answerSdp = new RTCSessionDescription(data.answer);
+                    window.peerConnection.setRemoteDescription(answerSdp)
+                        .then(() => updateStatus(STATUS.MATCHED, true))
+                        .catch(e => console.error("Error setting remote answer:", e));
+                }
+
+                // 2. Handle Incoming ICE Candidates
+                const incomingCandidatesField = isOfferer ? 'candidatesB' : 'candidatesA';
+                const processedCandidates = isOfferer ? processedCandidatesB : processedCandidatesA;
+                
+                const incomingCandidates = data[incomingCandidatesField] || [];
+                
+                incomingCandidates.forEach(candidate => {
+                    const candidateString = JSON.stringify(candidate);
+                    if (!processedCandidates.has(candidateString)) {
+                        processedCandidates.add(candidateString);
+                        window.peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
+                            .then(() => console.log('Added ICE candidate:', candidate.candidate))
+                            .catch(e => console.warn('Error adding ICE candidate:', e));
+                    }
+                });
+                
+                // 3. Cleanup old waiting matches (simple check)
+                // This is a basic cleanup mechanism for abandoned waiting docs
+                if (data.status === 'waiting' && data.createdAt < (new Date().getTime() - 360000)) {
+                    // Older than 6 minutes (360 seconds)
+                    console.log("Cleaning up old waiting document.");
+                    deleteDoc(window.matchDocRef).catch(e => console.warn("Cleanup failed:", e));
+                }
+            });
+        }
+
+
+        // --- Public Control Functions ---
+
+        window.startChat = async function () {
+            if (window.localStream) {
+                // Skip mic request if already granted
+                findOrCreateMatch();
+                return;
+            }
+
+            updateStatus(STATUS.REQUESTING_MIC);
+            enableControls(false, false);
+
+            try {
+                // Get audio stream (no video)
+                window.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                console.log("Microphone access granted.");
+                
+                // If stream successful, proceed to matchmaking
+                await findOrCreateMatch();
+                
+            } catch (error) {
+                console.error("Microphone access denied or failed:", error);
+                showModal("Microphone Required", "You must allow microphone access to start a voice chat.");
+                updateStatus(STATUS.IDLE);
+                enableControls(true, false);
+            }
+        }
+
+        window.stopChat = async function (keepLocalStream = true) {
+            console.log("Stopping chat...");
+            
+            // 1. Close WebRTC connection
+            if (window.peerConnection) {
+                window.peerConnection.close();
+                window.peerConnection = null;
+            }
+            
+            // 2. Stop local microphone tracks
+            if (!keepLocalStream && window.localStream) {
+                window.localStream.getTracks().forEach(track => track.stop());
+                window.localStream = null;
+            }
+
+            // 3. Remove remote audio source
+            elements.remoteAudio.srcObject = null;
+
+            // 4. Clean up Firestore match document
+            if (window.matchDocRef) {
+                // A batch operation to delete the match document is the cleanest way
+                const batch = writeBatch(window.db);
+                batch.delete(window.matchDocRef);
+                
+                // Try to delete the document (it will fail silently if the other user already deleted it)
+                try {
+                    await batch.commit();
+                    console.log("Match document deleted successfully.");
+                } catch (e) {
+                    console.warn("Failed to delete match document, likely already gone:", e.message);
+                }
+                window.matchDocRef = null;
+            }
+            
+            // 5. Reset state and UI
+            window.remotePeerId = null;
+            window.isWaiting = false;
+            updateStatus(STATUS.IDLE);
+            enableControls(true, false);
+        }
+
+        // Initialize everything on load
+        window.onload = initFirebase;
+    </script>
+</body>
+</html>
